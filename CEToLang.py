@@ -1,6 +1,4 @@
-import os
-import sys
-import subprocess
+import os, sys, subprocess, re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import xml.etree.ElementTree as ET
@@ -45,120 +43,197 @@ def select_file():
 
 # Function to parse the XML file
 def parse_xml(file_path):
-    tree = ET.parse(file_path)
-    root = tree.getroot()
+    context = ET.iterparse(file_path, events=("start", "end"))
+    context = iter(context)
+    event, root = next(context)
 
     cheat_entries = []
-    modules_declared = set()  # Keep track of declared modules
+    modules_declared = set()
 
-    for cheat in root.iter("CheatEntry"):
-        entry = {}
-        description = cheat.find("Description")
-        if description is not None:
-            entry["name"] = description.text.strip("\"")
-        else:
-            entry["name"] = "Unknown"
-
-        variable_type = cheat.find("VariableType")
-        if variable_type is not None and variable_type.text != "Auto Assembler Script":
-            entry["variable_type"] = variable_type.text
-        else:
-            entry["variable_type"] = None
-
-        address = cheat.find("Address")
-        if address is not None:
-            entry["address"] = address.text
-
-            # Handle offsets and pointers
-            if cheat.find("Offsets") is not None:
-                entry["type"] = "pointer"
-                offsets = [offset.text for offset in cheat.findall("Offsets/Offset")]
-                entry["offsets"] = offsets
-                # Extract module name if present in the address
-                if "exe" in entry["address"]:
-                    module = entry["address"].split("+")[0]
-                    entry["module"] = module
-                    modules_declared.add(module)
-            elif entry["address"].startswith('+'):
-                entry["type"] = "offset"
-                entry["offsets"] = [entry["address"]]
+    for event, elem in context:
+        if event == "end" and elem.tag == "CheatEntry":
+            entry = {}
+            description = elem.find("Description")
+            if description is not None:
+                entry["name"] = description.text.strip("\"")
             else:
-                entry["type"] = "direct"
-        else:
-            entry["type"] = None  # In case there's no address found, we set type as None
+                entry["name"] = "Unknown"
 
-        cheat_entries.append(entry)
+            variable_type = elem.find("VariableType")
+            if variable_type is not None and variable_type.text != "Auto Assembler Script":
+                entry["variable_type"] = variable_type.text
+            else:
+                entry["variable_type"] = None
+
+            address = elem.find("Address")
+            if address is not None:
+                entry["address"] = address.text
+
+                offsets = [offset.text for offset in elem.findall("Offsets/Offset")]
+                if offsets:
+                    entry["type"] = "offset"
+                    entry["offsets"] = offsets
+                elif elem.find("CheatEntries") is not None:
+                    entry["type"] = "namespace"
+                    entry["CheatEntries"] = []
+                    for subcheat in elem.findall("CheatEntries/CheatEntry"):
+                        subentry = {
+                            "name": subcheat.find("Description").text.strip("\""),
+                            "address": subcheat.find("Address").text.strip("+")
+                        }
+                        entry["CheatEntries"].append(subentry)
+                else:
+                    entry["type"] = "direct"
+            else:
+                entry["type"] = None
+
+            cheat_entries.append(entry)
+            root.clear()  # Clear root to free up memory
 
     return cheat_entries, modules_declared
+    
+def clean_name(name):
+    """Cleans up the name by removing leading numbers/spaces and unwanted characters."""
+    name = re.sub(r'^[0-9\s]+', '', name)  # Remove leading numbers or spaces
+    name = name.replace(" ", "_")
+    name = re.sub(r'[",.<>/?\-+()]+', '', name)  # Remove special characters
+    return name
 
-
-# Function to convert parsed data to the chosen language format
 def convert_to_language(cheat_entries, language):
-    output = ""
     module_bases = ""
-    modules_used = set()
-
-    for cheat in cheat_entries:
-        if cheat["type"] == "pointer" and "module" in cheat:
-            module = cheat["module"].replace('"','')
-            if module not in modules_used:
-                if language == "Python":
-                    module_bases += f"{module.split('.')[0]}base = utility.GetModuleBaseAddress(pid, \"{module}\")\n"
-                elif language == "C++":
-                    module_bases += f"uintptr_t {module.split('.')[0]}base = GetModuleBaseAddress(procId, \"{module}\");\n"
-                elif language == "C#":
-                    module_bases += f"IntPtr {module.split('.')[0]}base = yourlib.GetModuleBase(\"{module}\");\n"
-                modules_used.add(module)
-
-    if language == "Python":
-        output += """Converted to Python with CEToLang 0.8
-        Github Link:
-        https://github.com/Salis-dev/CEToLang/"""
-        output += "# Module base addresses\n" + module_bases + "\n# Parsed Cheats in Python\n"
+    pointers = ""
+    structures = ""
+    rest = ""
+    modules_used = set()  # To track which module bases were declared
+    
+    if language == "C++":
+        output = "//Module Bases\n"
+        
         for cheat in cheat_entries:
-            if cheat["type"] == "pointer" and "module" in cheat:
-                cheat['module'] = cheat['module'].replace('"','')
-                output += f"{cheat['name']} = {cheat['module'].split('.')[0]}base + 0x{cheat['address'].split('+')[1]}\n"
-                output += f"{cheat['name']}_offsets = [{', '.join(f'0x{offset}' for offset in cheat['offsets'])}]\n"
-            elif cheat["type"] == "offset":
-                output += f"{cheat['name']} = base_address + {cheat['offsets'][0]}\n"
-            elif cheat["type"] == "direct":
-                output += f"{cheat['name']} = {cheat['address']}\n"
-            output += "\n"
+            if cheat["type"] == "pointer" or cheat["type"] == "offset":
+                # Handle module base detection and declaration
+                if "exe" in cheat['address'] or "dll" in cheat['address']:
+                    module_name = cheat['address'].split('+')[0].replace('"', '')
+                    base_name = clean_name(module_name)
+                    if base_name not in modules_used:
+                        module_bases += f"uintptr_t {base_name}Base = GetModuleBaseAddress(procId, \"{module_name}\");\n"
+                        modules_used.add(base_name)
+                    addr = f"{base_name}Base + 0x{cheat['address'].split('+')[1]}"
+                else:
+                    addr = f"base_address + 0x{cheat['address'].strip('+')}"
+                
+                # Clean name and ensure only valid addresses are added
+                name = clean_name(cheat['name'])
+                pointers += f"uintptr_t {name} = {addr};\n"
+                if cheat.get('offsets'):
+                    pointers += f"std::vector<unsigned int> {name}Offsets = {{{', '.join(f'0x{offset}' for offset in cheat['offsets'])}}};\n"
 
-    elif language == "C++":
-        output += """Converted to C++ with CEToLang 0.8
-        Github Link:
-        https://github.com/Salis-dev/CEToLang/"""
-        output += "// Module base addresses\n" + module_bases + "\n// Parsed Cheats in C++\n"
-        for cheat in cheat_entries:           
-            if cheat["type"] == "pointer" and "module" in cheat:
-                cheat['module'] = cheat['module'].replace('"','')
-                output += f"uintptr_t {cheat['name']} = {cheat['module'].split('.')[0]}base + 0x{cheat['address'].split('+')[1]};\n"
-                output += f"std::vector<unsigned int> {cheat['name']}Offsets = {{{', '.join(f'0x{offset}' for offset in cheat['offsets'])}}};\n"
-            elif cheat["type"] == "offset":
-                output += f"uintptr_t {cheat['name']} = base_address + {cheat['offsets'][0]};\n"
-            elif cheat["type"] == "direct":
-                output += f"uintptr_t {cheat['name']} = {cheat['address']};\n"
-            output += "\n"
+            elif cheat["type"] == "namespace":
+                # Handle nested structures
+                namespace_name = clean_name(cheat['name']) if cheat['name'] != "Unknown" else "UnnamedStruct"
+                struct_output = f"namespace {namespace_name} {{\n"
+                for subcheat in cheat["CheatEntries"]:
+                    subname = clean_name(subcheat['name'])
+                    subaddress = f"0x{subcheat['address'].strip('+')}"
+                    struct_output += f"    constexpr auto {subname} = {subaddress};\n"
+                struct_output += "}\n\n"
+                structures += struct_output
 
+            elif cheat["type"] == "direct":
+                # Add loose cheats under "rest"
+                name = clean_name(cheat['name'])
+                rest += f"uintptr_t {name} = {cheat['address']};\n"
+            
+        # Group the output into sections
+        output += module_bases
+        output += "\n//Pointers\n" + pointers
+        output += "\n//Structures\n" + structures
+        output += "\n//Rest\n" + rest
+        return output
+    
+    # Logic for Python output
+    elif language == "Python":
+        output = "#Module Bases\n"
+        
+        for cheat in cheat_entries:
+            if cheat["type"] == "pointer" or cheat["type"] == "offset":
+                if "exe" in cheat['address'] or "dll" in cheat['address']:
+                    module_name = cheat['address'].split('+')[0].replace('"', '')
+                    base_name = clean_name(module_name)
+                    if base_name not in modules_used:
+                        module_bases += f"{base_name}Base = utility.GetModuleBaseAddress(pid, \"{module_name}\")\n"
+                        modules_used.add(base_name)
+                    addr = f"{base_name}Base + 0x{cheat['address'].split('+')[1]}"
+                else:
+                    addr = f"base_address + 0x{cheat['address'].strip('+')}"
+                
+                name = clean_name(cheat['name'])
+                pointers += f"{name} = {addr}\n"
+                if cheat.get('offsets'):
+                    pointers += f"{name}_offsets = [{', '.join(f'0x{offset}' for offset in cheat['offsets'])}]\n"
+
+            elif cheat["type"] == "namespace":
+                class_name = clean_name(cheat['name']) if cheat['name'] != "Unknown" else "UnnamedStruct"
+                struct_output = f"class {class_name}:\n"
+                for subcheat in cheat["CheatEntries"]:
+                    subname = clean_name(subcheat['name'])
+                    subaddress = f"0x{subcheat['address'].strip('+')}"
+                    struct_output += f"    {subname} = {subaddress}\n"
+                struct_output += "\n"
+                structures += struct_output
+
+            elif cheat["type"] == "direct":
+                name = clean_name(cheat['name'])
+                rest += f"{name} = {cheat['address']}\n"
+
+        # Group the output into sections
+        output += module_bases
+        output += "\n#Pointers\n" + pointers
+        output += "\n#Structures\n" + structures
+        output += "\n#Rest\n" + rest
+        return output
+
+    # Logic for C# output
     elif language == "C#":
-        output += """Converted to C# with CEToLang 0.8
-        Github Link:
-        https://github.com/Salis-dev/CEToLang/"""
-        output += "// Module base addresses\n" + module_bases + "\n// Parsed Cheats in C#\n"
+        output = "//Module Bases\n"
+        
         for cheat in cheat_entries:
-            if cheat["type"] == "pointer" and "module" in cheat:
-                cheat['module'] = cheat['module'].replace('"','')
-                output += f"IntPtr {cheat['name']} = new IntPtr({cheat['module'].split('.')[0]}base + 0x{cheat['address'].split('+')[1]});\n"
-                output += f"int[] {cheat['name']}Offsets = {{{', '.join(f'0x{offset}' for offset in cheat['offsets'])}}};\n"
-            elif cheat["type"] == "offset":
-                output += f"IntPtr {cheat['name']} = baseAddress + {cheat['offsets'][0]};\n"
-            elif cheat["type"] == "direct":
-                output += f"IntPtr {cheat['name']} = new IntPtr({cheat['address']});\n"
-            output += "\n"
+            if cheat["type"] == "pointer" or cheat["type"] == "offset":
+                if "exe" in cheat['address'] or "dll" in cheat['address']:
+                    module_name = cheat['address'].split('+')[0].replace('"', '')
+                    base_name = clean_name(module_name)
+                    if base_name not in modules_used:
+                        module_bases += f"IntPtr {base_name}Base = yourlib.GetModuleBase(\"{module_name}\");\n"
+                        modules_used.add(base_name)
+                    addr = f"{base_name}Base + 0x{cheat['address'].split('+')[1]}"
+                else:
+                    addr = f"baseAddress + 0x{cheat['address'].strip('+')}"
+                
+                name = clean_name(cheat['name'])
+                pointers += f"IntPtr {name} = {addr};\n"
+                if cheat.get('offsets'):
+                    pointers += f"int[] {name}Offsets = {{{', '.join(f'0x{offset}' for offset in cheat['offsets'])}}};\n"
 
-    return output
+            elif cheat["type"] == "namespace":
+                namespace_name = clean_name(cheat['name']) if cheat['name'] != "Unknown" else "UnnamedStruct"
+                struct_output = f"namespace {namespace_name} {{\n"
+                for subcheat in cheat["CheatEntries"]:
+                    subname = clean_name(subcheat['name'])
+                    subaddress = f"0x{subcheat['address'].strip('+')}"
+                    struct_output += f"    public const int {subname} = {subaddress};\n"
+                struct_output += "}\n\n"
+                structures += struct_output
+
+            elif cheat["type"] == "direct":
+                name = clean_name(cheat['name'])
+                rest += f"IntPtr {name} = new IntPtr({cheat['address']});\n"
+
+        # Group the output into sections
+        output += module_bases
+        output += "\n//Pointers\n" + pointers
+        output += "\n//Structures\n" + structures
+        output += "\n//Rest\n" + rest
+        return output
 
 
 # Function to save the output to a file
